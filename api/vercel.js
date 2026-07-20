@@ -1086,6 +1086,166 @@ function messagesPrepare(messages) {
     }
   }).join("\n\n");
 }
+function extractTextContent(content) {
+  if (_12.isString(content)) return content;
+  if (_12.isArray(content)) {
+    return content.filter((item) => item && item.type === "text").map((item) => item.text).join("\n");
+  }
+  return "";
+}
+function buildToolSystemPrompt(tools) {
+  const toolDefs = tools.map((t) => t && t.type === "function" && t.function ? t.function : t).filter(Boolean);
+  const toolsJson = JSON.stringify(toolDefs, null, 2);
+  return [
+    "# Tool Calling",
+    "",
+    "You are an agent with access to the tools listed below. When you need to use a tool, you MUST reply with one or more tool-call blocks in EXACTLY this format (Qwen native format):",
+    "",
+    "<tool_call>",
+    '{"name": "<tool_name>", "arguments": {<json-arguments>}}',
+    "</tool_call>",
+    "",
+    "Strict rules:",
+    "- When calling tools, output ONLY the <tool_call> block(s). Do NOT add any prose before or after them.",
+    `- "arguments" MUST be a valid JSON object that matches the tool's parameter schema.`,
+    "- To call several tools at once, emit several <tool_call> blocks back to back.",
+    "- Tool results are returned to you inside <tool_response> blocks. Use them to continue.",
+    "- When the task is finished and you are giving the final answer to the user, reply in plain text with NO <tool_call> block.",
+    "",
+    "Available tools (JSON Schema):",
+    "<tools>",
+    toolsJson,
+    "</tools>"
+  ].join("\n");
+}
+function safeParseToolJson(raw) {
+  if (!raw) return null;
+  let s = raw.trim();
+  const fence = s.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/);
+  if (fence) s = fence[1].trim();
+  try {
+    return JSON.parse(s);
+  } catch {
+    return null;
+  }
+}
+function toOpenAIToolCall(parsed) {
+  const args = parsed.arguments;
+  return {
+    id: `call_${util_default.uuid(false).slice(0, 24)}`,
+    type: "function",
+    function: {
+      name: parsed.name,
+      arguments: _12.isString(args) ? args : JSON.stringify(args ?? {})
+    }
+  };
+}
+function parseToolCalls(text) {
+  const toolCalls = [];
+  const regex = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/g;
+  let match;
+  while ((match = regex.exec(text)) !== null) {
+    const parsed = safeParseToolJson(match[1]);
+    if (parsed && parsed.name) toolCalls.push(toOpenAIToolCall(parsed));
+  }
+  let content = text.replace(regex, "").trim();
+  if (!toolCalls.length) {
+    const bare = safeParseToolJson(text);
+    if (bare && bare.name && bare.arguments !== void 0) {
+      toolCalls.push(toOpenAIToolCall(bare));
+      content = "";
+    }
+  }
+  return { content, toolCalls };
+}
+function messagesPrepareWithTools(messages, tools) {
+  const parts = [buildToolSystemPrompt(tools)];
+  for (const msg of messages) {
+    switch (msg.role) {
+      case "system": {
+        const c = extractTextContent(msg.content);
+        if (c) parts.push(`System: ${c}`);
+        break;
+      }
+      case "user": {
+        const c = extractTextContent(msg.content);
+        if (c) parts.push(`User: ${c}`);
+        break;
+      }
+      case "assistant": {
+        let c = extractTextContent(msg.content);
+        if (_12.isArray(msg.tool_calls) && msg.tool_calls.length) {
+          const calls = msg.tool_calls.map((tc) => {
+            const name = tc.function?.name;
+            let args = tc.function?.arguments;
+            try {
+              args = JSON.parse(args);
+            } catch {
+            }
+            return `<tool_call>
+${JSON.stringify({
+              name,
+              arguments: args ?? {}
+            })}
+</tool_call>`;
+          }).join("\n");
+          c = c ? `${c}
+${calls}` : calls;
+        }
+        if (c) parts.push(`Assistant: ${c}`);
+        break;
+      }
+      case "tool": {
+        const c = extractTextContent(msg.content);
+        const name = msg.name || msg.tool_call_id || "";
+        parts.push(
+          `Tool result${name ? ` for ${name}` : ""}:
+<tool_response>
+${c}
+</tool_response>`
+        );
+        break;
+      }
+    }
+  }
+  parts.push("Assistant:");
+  return parts.join("\n\n");
+}
+function buildStreamFromCompletion(completion) {
+  const transStream = new PassThrough();
+  const choice = completion.choices[0];
+  const base = {
+    id: completion.id,
+    model: completion.model,
+    object: "chat.completion.chunk",
+    created: completion.created
+  };
+  const send = (delta, finishReason = null) => transStream.write(
+    `data: ${JSON.stringify({
+      ...base,
+      choices: [{ index: 0, delta, finish_reason: finishReason }]
+    })}
+
+`
+  );
+  send({ role: "assistant", content: "" });
+  if (choice.message.tool_calls?.length) {
+    send({
+      tool_calls: choice.message.tool_calls.map((tc, i) => ({
+        index: i,
+        id: tc.id,
+        type: "function",
+        function: { name: tc.function.name, arguments: tc.function.arguments }
+      }))
+    });
+  } else if (choice.message.content) {
+    send({ content: choice.message.content });
+  }
+  send({}, choice.finish_reason || "stop");
+  transStream.write("data: [DONE]\n\n");
+  transStream.end();
+  return transStream;
+}
 function resolveModel(model) {
   return MODEL_MAP[model] || "qwen3.5-plus";
 }
@@ -1248,9 +1408,10 @@ async function receiveStream(model, stream) {
     });
   });
 }
-async function createCompletion(model, messages, token, refConvId, retryCount = 0) {
+async function createCompletion(model, messages, token, refConvId, retryCount = 0, tools, toolChoice) {
+  const useTools = _12.isArray(tools) && tools.length > 0 && toolChoice !== "none";
   return (async () => {
-    const content = messagesPrepare(messages);
+    const content = useTools ? messagesPrepareWithTools(messages, tools) : messagesPrepare(messages);
     const chatType = SEARCH_MODELS.includes(model) ? "search" : "t2t";
     const chatId = refConvId || await createConversation(model, token, chatType);
     const result = await sendCompletionRequest(model, chatId, content, token);
@@ -1270,6 +1431,47 @@ async function createCompletion(model, messages, token, refConvId, retryCount = 
     if (!refConvId) {
       removeConversation(chatId, token).catch(() => {
       });
+    }
+    if (useTools) {
+      const { content: cleaned, toolCalls } = parseToolCalls(responseContent);
+      if (toolCalls.length) {
+        return {
+          id: responseId || chatId,
+          model,
+          object: "chat.completion",
+          choices: [
+            {
+              index: 0,
+              message: {
+                role: "assistant",
+                content: cleaned || null,
+                tool_calls: toolCalls
+              },
+              finish_reason: "tool_calls"
+            }
+          ],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+          created: util_default.unixTimestamp()
+        };
+      }
+      return {
+        id: responseId || chatId,
+        model,
+        object: "chat.completion",
+        choices: [
+          {
+            index: 0,
+            message: {
+              role: "assistant",
+              content: cleaned,
+              ...thinkingContent ? { reasoning_content: thinkingContent } : {}
+            },
+            finish_reason: "stop"
+          }
+        ],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        created: util_default.unixTimestamp()
+      };
     }
     return {
       id: responseId || chatId,
@@ -1301,7 +1503,15 @@ async function createCompletion(model, messages, token, refConvId, retryCount = 
       );
       return (async () => {
         await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY));
-        return createCompletion(model, messages, token, null, retryCount + 1);
+        return createCompletion(
+          model,
+          messages,
+          token,
+          null,
+          retryCount + 1,
+          tools,
+          toolChoice
+        );
       })();
     }
     throw err;
@@ -1397,7 +1607,20 @@ function createTransStream(model, stream, chatId, endCallback) {
   });
   return transStream;
 }
-async function createCompletionStream(model, messages, token, refConvId, retryCount = 0) {
+async function createCompletionStream(model, messages, token, refConvId, retryCount = 0, tools, toolChoice) {
+  const useTools = _12.isArray(tools) && tools.length > 0 && toolChoice !== "none";
+  if (useTools) {
+    const completion = await createCompletion(
+      model,
+      messages,
+      token,
+      refConvId,
+      0,
+      tools,
+      toolChoice
+    );
+    return buildStreamFromCompletion(completion);
+  }
   return (async () => {
     const content = messagesPrepare(messages);
     const chatType = SEARCH_MODELS.includes(model) ? "search" : "t2t";
@@ -1458,15 +1681,15 @@ var chat_default2 = {
       }
       const tokens = chat_default.tokenSplit(request.headers.authorization);
       const token = _13.sample(tokens);
-      let { model, conversation_id: convId, messages, stream } = request.body;
+      let { model, conversation_id: convId, messages, stream, tools, tool_choice } = request.body;
       model = model.toLowerCase();
       if (stream) {
-        const stream2 = await chat_default.createCompletionStream(model, messages, token, convId);
+        const stream2 = await chat_default.createCompletionStream(model, messages, token, convId, 0, tools, tool_choice);
         return new Response(stream2, {
           type: "text/event-stream"
         });
       } else
-        return await chat_default.createCompletion(model, messages, token, convId);
+        return await chat_default.createCompletion(model, messages, token, convId, 0, tools, tool_choice);
     }
   }
 };

@@ -153,6 +153,203 @@ function messagesPrepare(messages: any[]): string {
 }
 
 /**
+ * 提取消息文本内容（支持字符串或OpenAI多模态数组）
+ */
+function extractTextContent(content: any): string {
+  if (_.isString(content)) return content;
+  if (_.isArray(content)) {
+    return content
+      .filter((item) => item && item.type === "text")
+      .map((item) => item.text)
+      .join("\n");
+  }
+  return "";
+}
+
+/**
+ * 构建工具调用(Function Calling)的系统提示词
+ * chat.qwen.ai 的网页后端不原生支持 OpenAI tools 协议，
+ * 因此这里用提示词方式让模型输出 Qwen 原生的 <tool_call> 格式，随后再解析回 OpenAI tool_calls。
+ */
+function buildToolSystemPrompt(tools: any[]): string {
+  const toolDefs = tools
+    .map((t) => (t && t.type === "function" && t.function ? t.function : t))
+    .filter(Boolean);
+  const toolsJson = JSON.stringify(toolDefs, null, 2);
+  return [
+    "# Tool Calling",
+    "",
+    "You are an agent with access to the tools listed below. When you need to use a tool, you MUST reply with one or more tool-call blocks in EXACTLY this format (Qwen native format):",
+    "",
+    "<tool_call>",
+    '{"name": "<tool_name>", "arguments": {<json-arguments>}}',
+    "</tool_call>",
+    "",
+    "Strict rules:",
+    "- When calling tools, output ONLY the <tool_call> block(s). Do NOT add any prose before or after them.",
+    '- "arguments" MUST be a valid JSON object that matches the tool\'s parameter schema.',
+    "- To call several tools at once, emit several <tool_call> blocks back to back.",
+    "- Tool results are returned to you inside <tool_response> blocks. Use them to continue.",
+    "- When the task is finished and you are giving the final answer to the user, reply in plain text with NO <tool_call> block.",
+    "",
+    "Available tools (JSON Schema):",
+    "<tools>",
+    toolsJson,
+    "</tools>",
+  ].join("\n");
+}
+
+/**
+ * 解析可能包裹在 markdown 代码块中的 JSON
+ */
+function safeParseToolJson(raw: string): any {
+  if (!raw) return null;
+  let s = raw.trim();
+  const fence = s.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/);
+  if (fence) s = fence[1].trim();
+  try {
+    return JSON.parse(s);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 将解析出的 {name, arguments} 转换为 OpenAI tool_call 结构
+ */
+function toOpenAIToolCall(parsed: any): any {
+  const args = parsed.arguments;
+  return {
+    id: `call_${util.uuid(false).slice(0, 24)}`,
+    type: "function",
+    function: {
+      name: parsed.name,
+      arguments: _.isString(args) ? args : JSON.stringify(args ?? {}),
+    },
+  };
+}
+
+/**
+ * 从模型文本输出中解析 <tool_call> 块，返回清理后的正文与 tool_calls 列表
+ */
+function parseToolCalls(text: string): { content: string; toolCalls: any[] } {
+  const toolCalls: any[] = [];
+  const regex = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/g;
+  let match: RegExpExecArray | null;
+  while ((match = regex.exec(text)) !== null) {
+    const parsed = safeParseToolJson(match[1]);
+    if (parsed && parsed.name) toolCalls.push(toOpenAIToolCall(parsed));
+  }
+  let content = text.replace(regex, "").trim();
+
+  // 回退：模型可能省略了标签，直接输出了一个裸的工具调用 JSON
+  if (!toolCalls.length) {
+    const bare = safeParseToolJson(text);
+    if (bare && bare.name && bare.arguments !== undefined) {
+      toolCalls.push(toOpenAIToolCall(bare));
+      content = "";
+    }
+  }
+  return { content, toolCalls };
+}
+
+/**
+ * 带工具定义的消息预处理：注入工具系统提示词，并把工具调用/结果历史还原为文本
+ */
+function messagesPrepareWithTools(messages: any[], tools: any[]): string {
+  const parts: string[] = [buildToolSystemPrompt(tools)];
+
+  for (const msg of messages) {
+    switch (msg.role) {
+      case "system": {
+        const c = extractTextContent(msg.content);
+        if (c) parts.push(`System: ${c}`);
+        break;
+      }
+      case "user": {
+        const c = extractTextContent(msg.content);
+        if (c) parts.push(`User: ${c}`);
+        break;
+      }
+      case "assistant": {
+        let c = extractTextContent(msg.content);
+        if (_.isArray(msg.tool_calls) && msg.tool_calls.length) {
+          const calls = msg.tool_calls
+            .map((tc: any) => {
+              const name = tc.function?.name;
+              let args: any = tc.function?.arguments;
+              try {
+                args = JSON.parse(args);
+              } catch {
+                /* keep raw */
+              }
+              return `<tool_call>\n${JSON.stringify({
+                name,
+                arguments: args ?? {},
+              })}\n</tool_call>`;
+            })
+            .join("\n");
+          c = c ? `${c}\n${calls}` : calls;
+        }
+        if (c) parts.push(`Assistant: ${c}`);
+        break;
+      }
+      case "tool": {
+        const c = extractTextContent(msg.content);
+        const name = msg.name || msg.tool_call_id || "";
+        parts.push(
+          `Tool result${name ? ` for ${name}` : ""}:\n<tool_response>\n${c}\n</tool_response>`
+        );
+        break;
+      }
+    }
+  }
+
+  // 提示模型继续输出
+  parts.push("Assistant:");
+  return parts.join("\n\n");
+}
+
+/**
+ * 把一个完整的 completion 结果转换为 SSE 流（用于带工具时的流式返回）
+ */
+function buildStreamFromCompletion(completion: any): PassThrough {
+  const transStream = new PassThrough();
+  const choice = completion.choices[0];
+  const base = {
+    id: completion.id,
+    model: completion.model,
+    object: "chat.completion.chunk",
+    created: completion.created,
+  };
+  const send = (delta: any, finishReason: any = null) =>
+    transStream.write(
+      `data: ${JSON.stringify({
+        ...base,
+        choices: [{ index: 0, delta, finish_reason: finishReason }],
+      })}\n\n`
+    );
+
+  send({ role: "assistant", content: "" });
+  if (choice.message.tool_calls?.length) {
+    send({
+      tool_calls: choice.message.tool_calls.map((tc: any, i: number) => ({
+        index: i,
+        id: tc.id,
+        type: "function",
+        function: { name: tc.function.name, arguments: tc.function.arguments },
+      })),
+    });
+  } else if (choice.message.content) {
+    send({ content: choice.message.content });
+  }
+  send({}, choice.finish_reason || "stop");
+  transStream.write("data: [DONE]\n\n");
+  transStream.end();
+  return transStream;
+}
+
+/**
  * 确定实际使用的Qwen模型ID
  */
 function resolveModel(model: string): string {
@@ -389,10 +586,16 @@ async function createCompletion(
   messages: any[],
   token: string,
   refConvId?: string,
-  retryCount = 0
+  retryCount = 0,
+  tools?: any[],
+  toolChoice?: any
 ) {
+  const useTools =
+    _.isArray(tools) && tools.length > 0 && toolChoice !== "none";
   return (async () => {
-    const content = messagesPrepare(messages);
+    const content = useTools
+      ? messagesPrepareWithTools(messages, tools)
+      : messagesPrepare(messages);
     const chatType = SEARCH_MODELS.includes(model) ? "search" : "t2t";
     const chatId =
       refConvId || (await createConversation(model, token, chatType));
@@ -418,6 +621,51 @@ async function createCompletion(
     // 异步删除对话
     if (!refConvId) {
       removeConversation(chatId, token).catch(() => {});
+    }
+
+    // 工具模式：解析 <tool_call> 并以 OpenAI tool_calls 返回
+    if (useTools) {
+      const { content: cleaned, toolCalls } = parseToolCalls(responseContent);
+      if (toolCalls.length) {
+        return {
+          id: responseId || chatId,
+          model,
+          object: "chat.completion",
+          choices: [
+            {
+              index: 0,
+              message: {
+                role: "assistant",
+                content: cleaned || null,
+                tool_calls: toolCalls,
+              },
+              finish_reason: "tool_calls",
+            },
+          ],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+          created: util.unixTimestamp(),
+        };
+      }
+      return {
+        id: responseId || chatId,
+        model,
+        object: "chat.completion",
+        choices: [
+          {
+            index: 0,
+            message: {
+              role: "assistant",
+              content: cleaned,
+              ...(thinkingContent
+                ? { reasoning_content: thinkingContent }
+                : {}),
+            },
+            finish_reason: "stop",
+          },
+        ],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        created: util.unixTimestamp(),
+      };
     }
 
     return {
@@ -452,7 +700,15 @@ async function createCompletion(
       );
       return (async () => {
         await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY));
-        return createCompletion(model, messages, token, null, retryCount + 1);
+        return createCompletion(
+          model,
+          messages,
+          token,
+          null,
+          retryCount + 1,
+          tools,
+          toolChoice
+        );
       })();
     }
     throw err;
@@ -583,8 +839,25 @@ async function createCompletionStream(
   messages: any[],
   token: string,
   refConvId?: string,
-  retryCount = 0
+  retryCount = 0,
+  tools?: any[],
+  toolChoice?: any
 ) {
+  const useTools =
+    _.isArray(tools) && tools.length > 0 && toolChoice !== "none";
+  // 工具模式：先取得完整结果（含 tool_calls 解析），再以 SSE 形式一次性回放
+  if (useTools) {
+    const completion = await createCompletion(
+      model,
+      messages,
+      token,
+      refConvId,
+      0,
+      tools,
+      toolChoice
+    );
+    return buildStreamFromCompletion(completion);
+  }
   return (async () => {
     const content = messagesPrepare(messages);
     const chatType = SEARCH_MODELS.includes(model) ? "search" : "t2t";
