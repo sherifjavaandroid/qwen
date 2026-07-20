@@ -1,7 +1,11 @@
 import axios from 'axios';
 import { v4 as uuid } from 'uuid';
 
-const TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6ImE5Yjc2Mjc0LThlMTgtNDVmMC1hNDIyLTY4ZjE0YTAzN2NjYSIsImxhc3RfcGFzc3dvcmRfY2hhbmdlIjoxNzc1MzE1MjAzLCJleHAiOjE3Nzc5MDg5MjJ9.BmgVeHe-3Qz1ZzIl23-pqrcRwB12LIsr56Vcj9XKCDY";
+const TOKEN = process.env.QWEN_TOKEN || "";
+if (!TOKEN) {
+  console.error("Set your chat.qwen.ai token first:  QWEN_TOKEN=... node test-api.js");
+  process.exit(1);
+}
 const BASE = "https://chat.qwen.ai";
 
 const FAKE_HEADERS = {
